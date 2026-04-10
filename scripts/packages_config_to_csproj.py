@@ -77,32 +77,63 @@ def parse_packages_config(path: Path) -> list[dict]:
     return packages
 
 
+# Canonical .NET Framework TFM order from oldest to newest.
+# Used to resolve the lowest common TFM across all packages in a packages.config,
+# which avoids NU1202 errors from very old packages (e.g. net35-only packages like
+# MarkdownDeep.NET) that AssetTargetFallback cannot rescue when targeting net48.
+_NET_TFM_ORDER = [
+    "net20", "net30", "net35",
+    "net40", "net403",
+    "net45", "net451", "net452",
+    "net46", "net461", "net462",
+    "net47", "net471", "net472",
+    "net48", "net481",
+]
+
+
+def _tfm_rank(tfm: str) -> int:
+    """Return a sortable rank for a TFM string. Unknown TFMs sort to the end."""
+    try:
+        return _NET_TFM_ORDER.index(tfm.lower())
+    except ValueError:
+        return len(_NET_TFM_ORDER)
+
+
 def resolve_target_framework(packages: list[dict], fallback: str = "net48") -> str:
     """
-    Pick a single TargetFramework for the synthetic .csproj.
+    Pick the LOWEST common TargetFramework across all packages.
+
+    Why lowest, not highest?
+    ========================
+    Targeting the highest TFM (e.g. net48) causes NU1202 errors when a package only
+    ships a very old TFM asset (e.g. MarkdownDeep.NET 1.5.0 ships only netframework35).
+    AssetTargetFallback cannot rescue this because it only applies to .NETStandard /
+    .NETCoreApp targets, not to full .NET Framework targets.
+
+    Targeting the lowest TFM ensures every package in the list can resolve: a package
+    that ships net35 assets will satisfy a net35 target, and packages that ship net48
+    assets will also satisfy it via NuGet's upward compatibility chain (net48 assets
+    are compatible with net35 projects). The goal here is dependency graph resolution
+    for Semgrep scanning, not actual compilation, so the lower TFM is fine.
 
     Strategy:
       1. Collect all unique non-empty targetFramework values.
-      2. If only one — use it.
-      3. If multiple — prefer the highest net* version (simple string sort works for net4x).
-      4. If none — use the fallback.
+      2. Return the lowest-ranked one according to _NET_TFM_ORDER.
+      3. If none found, use the fallback.
     """
-    tfms = sorted(
-        set(p["targetFramework"] for p in packages if p["targetFramework"]),
-        reverse=True,
-    )
+    tfms = list(set(p["targetFramework"] for p in packages if p["targetFramework"]))
     if not tfms:
         return fallback
-    if len(tfms) == 1:
-        return tfms[0]
 
-    # Multiple TFMs: warn and pick highest
-    print(
-        f"  [WARN] Multiple targetFramework values found: {tfms}. "
-        f"Using '{tfms[0]}'. Consider reviewing the synthetic .csproj.",
-        file=sys.stderr,
-    )
-    return tfms[0]
+    lowest = min(tfms, key=_tfm_rank)
+
+    if len(tfms) > 1:
+        print(
+            f"  [INFO] Multiple targetFramework values found: {sorted(tfms)}. "
+            f"Using lowest '{lowest}' to avoid NU1202 on legacy packages.",
+            file=sys.stderr,
+        )
+    return lowest
 
 
 def build_csproj(packages: list[dict], target_framework: str) -> str:

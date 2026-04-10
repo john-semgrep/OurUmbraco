@@ -171,14 +171,32 @@ class TestResolveTargetFramework:
         packages = [{"targetFramework": ""}]
         assert resolve_target_framework(packages, fallback="net472") == "net472"
 
-    def test_multiple_tfms_picks_highest(self):
+    def test_multiple_tfms_picks_lowest(self):
+        """
+        Must pick the LOWEST TFM to avoid NU1202 on legacy packages.
+        e.g. if any package only ships net35, targeting net48 will fail restore.
+        Targeting net35 lets everything resolve via NuGet upward compatibility.
+        """
         packages = [
             {"targetFramework": "net45"},
             {"targetFramework": "net48"},
             {"targetFramework": "net46"},
         ]
         result = resolve_target_framework(packages)
-        assert result == "net48"
+        assert result == "net45"
+
+    def test_legacy_net35_package_picks_net35(self):
+        """
+        Reproduces the OurUmbraco MarkdownDeep.NET scenario:
+        one package is net48, another is net35-only.
+        Must pick net35 so dotnet restore does not throw NU1202.
+        """
+        packages = [
+            {"targetFramework": "net48"},
+            {"targetFramework": "net35"},
+        ]
+        result = resolve_target_framework(packages)
+        assert result == "net35"
 
     def test_mixed_empty_and_real_tfm(self):
         packages = [
