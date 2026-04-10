@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 """
 packages_config_to_csproj.py
 
@@ -117,6 +117,10 @@ def build_csproj(packages: list[dict], target_framework: str) -> str:
         "",
         "  <PropertyGroup>",
         f"    <TargetFramework>{target_framework}</TargetFramework>",
+        "    <!-- Allow restore to fall back to older TFM assets (e.g. net35, net40). -->",
+        "    <!-- This mirrors how packages.config projects handled legacy packages:   -->",
+        "    <!-- they used whatever lib asset was available regardless of TFM.        -->",
+        "    <AssetTargetFallback>$(AssetTargetFallback);net45;net40;net35;net20</AssetTargetFallback>",
         "    <!-- Disable build output so this project is never accidentally compiled -->",
         "    <IsPackable>false</IsPackable>",
         "  </PropertyGroup>",

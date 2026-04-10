@@ -244,6 +244,27 @@ class TestBuildCsproj:
         result = build_csproj(packages, "net48")
         assert "dev dependency" in result
 
+    def test_asset_target_fallback_present(self):
+        """
+        AssetTargetFallback must be present so that legacy packages (e.g. net35-only
+        packages like MarkdownDeep.NET) resolve successfully against a net48 target.
+        Without this, dotnet restore raises NU1202 and the whole project fails.
+        """
+        result = build_csproj(self._packages(), "net48")
+        assert "AssetTargetFallback" in result
+        assert "net35" in result
+        assert "net40" in result
+
+    def test_asset_target_fallback_is_valid_xml(self):
+        """AssetTargetFallback value must parse as valid XML (no typos in the element name)."""
+        result = build_csproj(self._packages(), "net48")
+        root = parse_csproj_string(result)
+        fallback = root.findtext(".//AssetTargetFallback")
+        assert fallback is not None
+        assert "net35" in fallback
+        assert "net40" in fallback
+        assert "net45" in fallback
+
 
 # ---------------------------------------------------------------------------
 # Test: convert (integration)
