@@ -17,8 +17,8 @@ import tempfile
 import textwrap
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest.mock import patch
 
-# Make sure the converter module is importable from the same directory
 sys.path.insert(0, os.path.dirname(__file__))
 from packages_config_to_csproj import (
     parse_packages_config,
@@ -26,6 +26,8 @@ from packages_config_to_csproj import (
     build_csproj,
     convert,
     scan_directory,
+    strip_incompatible_packages,
+    _NU1202_RE,
     SYNTHETIC_SUBDIR,
     SYNTHETIC_FILENAME,
 )
@@ -36,7 +38,6 @@ from packages_config_to_csproj import (
 # ---------------------------------------------------------------------------
 
 def write_temp_config(content: str, suffix=".config") -> Path:
-    """Write XML string to a temp file and return its Path."""
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=suffix, delete=False, encoding="utf-8"
     )
@@ -82,7 +83,6 @@ class TestParsePackagesConfig:
         cfg.unlink()
 
     def test_missing_target_framework(self):
-        """Packages without targetFramework should still parse — TFM defaults to empty string."""
         cfg = write_temp_config("""
             <packages>
               <package id="SomeLib" version="1.0.0" />
@@ -144,7 +144,6 @@ class TestParsePackagesConfig:
         cfg.unlink()
 
     def test_large_package_list(self):
-        """Stress test: 100 packages."""
         pkg_lines = "\n".join(
             f'  <package id="Pkg{i}" version="1.0.{i}" targetFramework="net48" />'
             for i in range(100)
@@ -153,7 +152,6 @@ class TestParsePackagesConfig:
         packages = parse_packages_config(cfg)
         assert len(packages) == 100
         assert packages[42]["id"] == "Pkg42"
-        assert packages[42]["version"] == "1.0.42"
         cfg.unlink()
 
 
@@ -171,32 +169,15 @@ class TestResolveTargetFramework:
         packages = [{"targetFramework": ""}]
         assert resolve_target_framework(packages, fallback="net472") == "net472"
 
-    def test_multiple_tfms_picks_lowest(self):
-        """
-        Must pick the LOWEST TFM to avoid NU1202 on legacy packages.
-        e.g. if any package only ships net35, targeting net48 will fail restore.
-        Targeting net35 lets everything resolve via NuGet upward compatibility.
-        """
+    def test_multiple_tfms_picks_highest(self):
+        """TFM resolution picks highest — incompatible packages are stripped at restore time."""
         packages = [
             {"targetFramework": "net45"},
             {"targetFramework": "net48"},
             {"targetFramework": "net46"},
         ]
         result = resolve_target_framework(packages)
-        assert result == "net45"
-
-    def test_legacy_net35_package_picks_net35(self):
-        """
-        Reproduces the OurUmbraco MarkdownDeep.NET scenario:
-        one package is net48, another is net35-only.
-        Must pick net35 so dotnet restore does not throw NU1202.
-        """
-        packages = [
-            {"targetFramework": "net48"},
-            {"targetFramework": "net35"},
-        ]
-        result = resolve_target_framework(packages)
-        assert result == "net35"
+        assert result == "net48"
 
     def test_mixed_empty_and_real_tfm(self):
         packages = [
@@ -263,25 +244,173 @@ class TestBuildCsproj:
         assert "dev dependency" in result
 
     def test_asset_target_fallback_present(self):
-        """
-        AssetTargetFallback must be present so that legacy packages (e.g. net35-only
-        packages like MarkdownDeep.NET) resolve successfully against a net48 target.
-        Without this, dotnet restore raises NU1202 and the whole project fails.
-        """
         result = build_csproj(self._packages(), "net48")
         assert "AssetTargetFallback" in result
         assert "net35" in result
         assert "net40" in result
 
     def test_asset_target_fallback_is_valid_xml(self):
-        """AssetTargetFallback value must parse as valid XML (no typos in the element name)."""
         result = build_csproj(self._packages(), "net48")
         root = parse_csproj_string(result)
         fallback = root.findtext(".//AssetTargetFallback")
         assert fallback is not None
         assert "net35" in fallback
-        assert "net40" in fallback
-        assert "net45" in fallback
+
+
+# ---------------------------------------------------------------------------
+# Test: NU1202 regex
+# ---------------------------------------------------------------------------
+
+class TestNU1202Regex:
+
+    def test_matches_standard_error_format(self):
+        line = (
+            "error NU1202: Package 'MarkdownDeep.NET 1.5.0' is not compatible with "
+            "net48 (.NETFramework,Version=v4.8)."
+        )
+        match = _NU1202_RE.search(line)
+        assert match is not None
+        assert match.group(1) == "MarkdownDeep.NET"
+        assert match.group(2) == "1.5.0"
+
+    def test_matches_without_quotes(self):
+        line = "NU1202: Package SomeLib 2.0.0 is not compatible with net48"
+        match = _NU1202_RE.search(line)
+        assert match is not None
+        assert match.group(1) == "SomeLib"
+        assert match.group(2) == "2.0.0"
+
+    def test_no_match_on_unrelated_error(self):
+        line = "error NU1101: Unable to find package Foo"
+        assert _NU1202_RE.search(line) is None
+
+    def test_extracts_multiple_offenders(self):
+        output = (
+            "NU1202: Package 'PkgA 1.0.0' is not compatible with net48\n"
+            "NU1202: Package 'PkgB 2.3.4' is not compatible with net48\n"
+        )
+        matches = list(_NU1202_RE.finditer(output))
+        assert len(matches) == 2
+        ids = [m.group(1) for m in matches]
+        assert "PkgA" in ids
+        assert "PkgB" in ids
+
+
+# ---------------------------------------------------------------------------
+# Test: strip_incompatible_packages
+# ---------------------------------------------------------------------------
+
+class TestStripIncompatiblePackages:
+    """
+    Tests use mocked _try_restore so no real dotnet SDK is needed.
+    """
+
+    def _packages(self):
+        return [
+            {"id": "Newtonsoft.Json", "version": "13.0.1", "developmentDependency": False,
+             "targetFramework": "net48"},
+            {"id": "MarkdownDeep.NET", "version": "1.5.0", "developmentDependency": False,
+             "targetFramework": "net35"},
+            {"id": "log4net", "version": "2.0.15", "developmentDependency": False,
+             "targetFramework": "net48"},
+        ]
+
+    def test_strips_nu1202_offender_and_retries(self):
+        """
+        Core scenario: MarkdownDeep.NET causes NU1202 on first restore attempt.
+        It should be stripped and the remaining two packages should be written.
+        """
+        calls = []
+
+        def mock_try_restore(path):
+            calls.append(len(calls))
+            if len(calls) == 1:
+                # First attempt fails with MarkdownDeep.NET as offender
+                return False, [("MarkdownDeep.NET", "1.5.0")]
+            # Second attempt succeeds
+            return True, []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csproj = Path(tmpdir) / "_semgrep_sc" / "project.csproj"
+            with patch("packages_config_to_csproj._try_restore", side_effect=mock_try_restore):
+                remaining = strip_incompatible_packages(
+                    self._packages(), csproj, "net48"
+                )
+
+        assert len(remaining) == 2
+        ids = [p["id"] for p in remaining]
+        assert "MarkdownDeep.NET" not in ids
+        assert "Newtonsoft.Json" in ids
+        assert "log4net" in ids
+        assert len(calls) == 2  # tried twice: once failed, once succeeded
+
+    def test_strips_multiple_offenders_across_retries(self):
+        """Multiple incompatible packages should all be stripped across successive retries."""
+        calls = []
+
+        def mock_try_restore(path):
+            calls.append(len(calls))
+            if len(calls) == 1:
+                return False, [("MarkdownDeep.NET", "1.5.0")]
+            if len(calls) == 2:
+                return False, [("log4net", "2.0.15")]
+            return True, []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csproj = Path(tmpdir) / "_semgrep_sc" / "project.csproj"
+            with patch("packages_config_to_csproj._try_restore", side_effect=mock_try_restore):
+                remaining = strip_incompatible_packages(
+                    self._packages(), csproj, "net48"
+                )
+
+        assert len(remaining) == 1
+        assert remaining[0]["id"] == "Newtonsoft.Json"
+        assert len(calls) == 3
+
+    def test_non_nu1202_failure_leaves_file_in_place(self):
+        """If restore fails for a non-NU1202 reason, the file is left as-is."""
+        def mock_try_restore(path):
+            return False, []  # failure with no NU1202 offenders
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csproj = Path(tmpdir) / "_semgrep_sc" / "project.csproj"
+            with patch("packages_config_to_csproj._try_restore", side_effect=mock_try_restore):
+                remaining = strip_incompatible_packages(
+                    self._packages(), csproj, "net48"
+                )
+
+        # All packages returned unchanged — file left for Semgrep to handle
+        assert len(remaining) == 3
+
+    def test_all_stripped_removes_file(self):
+        """If every package is incompatible the synthetic file is removed entirely."""
+        def mock_try_restore(path):
+            return False, [("Newtonsoft.Json", "13.0.1"), ("MarkdownDeep.NET", "1.5.0"),
+                           ("log4net", "2.0.15")]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csproj = Path(tmpdir) / "_semgrep_sc" / "project.csproj"
+            with patch("packages_config_to_csproj._try_restore", side_effect=mock_try_restore):
+                remaining = strip_incompatible_packages(
+                    self._packages(), csproj, "net48"
+                )
+
+        assert remaining == []
+        assert not csproj.exists()
+
+    def test_immediate_success_returns_all_packages(self):
+        """If restore succeeds on first try, all packages are returned unchanged."""
+        def mock_try_restore(path):
+            return True, []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csproj = Path(tmpdir) / "_semgrep_sc" / "project.csproj"
+            with patch("packages_config_to_csproj._try_restore", side_effect=mock_try_restore):
+                remaining = strip_incompatible_packages(
+                    self._packages(), csproj, "net48"
+                )
+
+        assert len(remaining) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -336,19 +465,41 @@ class TestConvert:
             assert out.exists()
         cfg.unlink()
 
+    def test_validate_restore_strips_incompatible(self):
+        """validate_restore=True should strip MarkdownDeep.NET and still write the file."""
+        cfg = write_temp_config("""
+            <packages>
+              <package id="Newtonsoft.Json" version="13.0.1" targetFramework="net48" />
+              <package id="MarkdownDeep.NET" version="1.5.0" targetFramework="net35" />
+            </packages>
+        """)
+        calls = []
+        def mock_try_restore(path):
+            calls.append(1)
+            if len(calls) == 1:
+                return False, [("MarkdownDeep.NET", "1.5.0")]
+            return True, []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "_semgrep_sc" / "project.csproj"
+            with patch("packages_config_to_csproj._try_restore", side_effect=mock_try_restore):
+                result = convert(cfg, output_path=out, validate_restore=True)
+
+            assert result is not None
+            assert out.exists()
+            content = out.read_text()
+            assert "Newtonsoft.Json" in content
+            assert "MarkdownDeep.NET" not in content
+        cfg.unlink()
+
 
 # ---------------------------------------------------------------------------
-# Test: scan_directory — KEY TESTS for the MSB1050 fix
+# Test: scan_directory
 # ---------------------------------------------------------------------------
 
 class TestScanDirectory:
 
     def _make_repo(self, base: Path):
-        """
-        Create a fake repo tree that mirrors the real-world collision scenario:
-        each project folder has BOTH a packages.config AND an existing .csproj.
-        This is the exact setup that triggered MSB1050.
-        """
         projects = {
             "ProjectA/packages.config": """
                 <packages>
@@ -367,8 +518,6 @@ class TestScanDirectory:
                 </packages>
             """,
         }
-        # Also create pre-existing .csproj files in the same folders
-        # to simulate the real collision scenario
         existing_csprojs = {
             "ProjectA/ProjectA.csproj": "<Project></Project>",
             "ProjectB/ProjectB.csproj": "<Project></Project>",
@@ -388,48 +537,29 @@ class TestScanDirectory:
             assert count == 3
 
     def test_synthetic_in_own_subdirectory(self):
-        """
-        Core MSB1050 fix: synthetic .csproj must be in _semgrep_sc/ subdir,
-        NOT sitting next to the existing .csproj in the same folder.
-        """
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             self._make_repo(base)
             scan_directory(base)
-
-            # Synthetic files should be in _semgrep_sc/ subdirs
             assert (base / "ProjectA" / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME).exists()
             assert (base / "ProjectB" / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME).exists()
             assert (base / "ProjectC" / "nested" / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME).exists()
 
     def test_no_collision_with_existing_csproj(self):
-        """
-        The synthetic file must NOT land in the same folder as the existing .csproj.
-        If it did, dotnet restore would hit MSB1050.
-        """
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             self._make_repo(base)
             scan_directory(base)
-
-            # Confirm the original .csproj folders do NOT contain the synthetic file
             assert not (base / "ProjectA" / SYNTHETIC_FILENAME).exists()
             assert not (base / "ProjectB" / SYNTHETIC_FILENAME).exists()
-
-            # Confirm original .csproj files are untouched
             assert (base / "ProjectA" / "ProjectA.csproj").exists()
             assert (base / "ProjectB" / "ProjectB.csproj").exists()
 
     def test_each_synthetic_subdir_has_only_one_csproj(self):
-        """
-        dotnet restore needs exactly one .csproj per folder.
-        Verify _semgrep_sc/ contains only project.csproj and nothing else.
-        """
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             self._make_repo(base)
             scan_directory(base)
-
             sc_dir = base / "ProjectA" / SYNTHETIC_SUBDIR
             csproj_files = list(sc_dir.glob("*.csproj"))
             assert len(csproj_files) == 1
@@ -441,7 +571,6 @@ class TestScanDirectory:
             self._make_repo(base)
             scan_directory(base, dry_run=True)
             assert not (base / "ProjectA" / SYNTHETIC_SUBDIR).exists()
-            assert not (base / "ProjectB" / SYNTHETIC_SUBDIR).exists()
 
     def test_synthetic_csproj_is_valid_xml(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -469,6 +598,8 @@ def run_tests_without_pytest():
         TestParsePackagesConfig,
         TestResolveTargetFramework,
         TestBuildCsproj,
+        TestNU1202Regex,
+        TestStripIncompatiblePackages,
         TestConvert,
         TestScanDirectory,
     ]

@@ -10,6 +10,10 @@ Each synthetic .csproj is placed in its own subdirectory (_semgrep_sc/)
 next to the packages.config. This avoids the MSB1050 error that occurs
 when dotnet restore finds multiple .csproj files in the same folder.
 
+If dotnet restore fails with NU1202 (incompatible package TFM), the
+offending packages are automatically stripped and restore is retried,
+so that the remaining compatible packages are still scanned.
+
 Usage:
     # Single file, output to stdout
     python packages_config_to_csproj.py packages.config
@@ -25,6 +29,8 @@ Usage:
 """
 
 import argparse
+import re
+import subprocess
 import sys
 import os
 import xml.etree.ElementTree as ET
@@ -47,7 +53,6 @@ def parse_packages_config(path: Path) -> list[dict]:
 
     root = tree.getroot()
 
-    # Handle both <packages> root and bare <package> roots (malformed but seen in the wild)
     if root.tag == "packages":
         package_elements = root.findall("package")
     elif root.tag == "package":
@@ -78,9 +83,6 @@ def parse_packages_config(path: Path) -> list[dict]:
 
 
 # Canonical .NET Framework TFM order from oldest to newest.
-# Used to resolve the lowest common TFM across all packages in a packages.config,
-# which avoids NU1202 errors from very old packages (e.g. net35-only packages like
-# MarkdownDeep.NET) that AssetTargetFallback cannot rescue when targeting net48.
 _NET_TFM_ORDER = [
     "net20", "net30", "net35",
     "net40", "net403",
@@ -101,39 +103,22 @@ def _tfm_rank(tfm: str) -> int:
 
 def resolve_target_framework(packages: list[dict], fallback: str = "net48") -> str:
     """
-    Pick the LOWEST common TargetFramework across all packages.
-
-    Why lowest, not highest?
-    ========================
-    Targeting the highest TFM (e.g. net48) causes NU1202 errors when a package only
-    ships a very old TFM asset (e.g. MarkdownDeep.NET 1.5.0 ships only netframework35).
-    AssetTargetFallback cannot rescue this because it only applies to .NETStandard /
-    .NETCoreApp targets, not to full .NET Framework targets.
-
-    Targeting the lowest TFM ensures every package in the list can resolve: a package
-    that ships net35 assets will satisfy a net35 target, and packages that ship net48
-    assets will also satisfy it via NuGet's upward compatibility chain (net48 assets
-    are compatible with net35 projects). The goal here is dependency graph resolution
-    for Semgrep scanning, not actual compilation, so the lower TFM is fine.
-
-    Strategy:
-      1. Collect all unique non-empty targetFramework values.
-      2. Return the lowest-ranked one according to _NET_TFM_ORDER.
-      3. If none found, use the fallback.
+    Pick the highest TargetFramework across all packages.
+    Incompatible packages are handled at restore time by strip_incompatible_packages().
     """
     tfms = list(set(p["targetFramework"] for p in packages if p["targetFramework"]))
     if not tfms:
         return fallback
 
-    lowest = min(tfms, key=_tfm_rank)
+    highest = max(tfms, key=_tfm_rank)
 
     if len(tfms) > 1:
         print(
             f"  [INFO] Multiple targetFramework values found: {sorted(tfms)}. "
-            f"Using lowest '{lowest}' to avoid NU1202 on legacy packages.",
+            f"Using highest '{highest}'.",
             file=sys.stderr,
         )
-    return lowest
+    return highest
 
 
 def build_csproj(packages: list[dict], target_framework: str) -> str:
@@ -149,8 +134,6 @@ def build_csproj(packages: list[dict], target_framework: str) -> str:
         "  <PropertyGroup>",
         f"    <TargetFramework>{target_framework}</TargetFramework>",
         "    <!-- Allow restore to fall back to older TFM assets (e.g. net35, net40). -->",
-        "    <!-- This mirrors how packages.config projects handled legacy packages:   -->",
-        "    <!-- they used whatever lib asset was available regardless of TFM.        -->",
         "    <AssetTargetFallback>$(AssetTargetFallback);net45;net40;net35;net20</AssetTargetFallback>",
         "    <!-- Disable build output so this project is never accidentally compiled -->",
         "    <IsPackable>false</IsPackable>",
@@ -176,9 +159,125 @@ def build_csproj(packages: list[dict], target_framework: str) -> str:
     return "\n".join(lines)
 
 
-def convert(input_path: Path, output_path: Path | None = None, dry_run: bool = False) -> str | None:
+# ---------------------------------------------------------------------------
+# Restore validation + incompatible package stripping
+# ---------------------------------------------------------------------------
+
+# Matches: error NU1202: Package 'SomePackage 1.2.3' is not compatible with ...
+_NU1202_RE = re.compile(
+    r"NU1202: Package '?([A-Za-z0-9._\-]+)\s+([\d.]+)'? is not compatible",
+    re.IGNORECASE,
+)
+
+
+def _try_restore(csproj_path: Path) -> tuple[bool, list[tuple[str, str]]]:
     """
-    Full pipeline: parse → resolve TFM → render → optionally write.
+    Attempt dotnet restore on the synthetic .csproj.
+    Returns (success, [(package_id, version), ...]) where the list contains
+    any packages that caused NU1202 incompatibility errors.
+    """
+    result = subprocess.run(
+        ["dotnet", "restore", str(csproj_path), "--no-dependencies"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True, []
+
+    # Parse NU1202 offenders from stderr + stdout
+    combined = result.stdout + result.stderr
+    offenders = []
+    for match in _NU1202_RE.finditer(combined):
+        offenders.append((match.group(1), match.group(2)))
+
+    return False, offenders
+
+
+def strip_incompatible_packages(
+    packages: list[dict],
+    csproj_path: Path,
+    target_framework: str,
+    max_retries: int = 5,
+) -> list[dict]:
+    """
+    Write the synthetic .csproj, attempt dotnet restore, and if it fails with
+    NU1202 errors strip the offending packages and retry. Repeat up to
+    max_retries times so that multiple incompatible packages are all removed.
+
+    Returns the final list of compatible packages (may be smaller than input).
+    This is a no-op when dotnet is not on PATH (e.g. during unit tests that
+    don't have a real .NET SDK available) — in that case the full list is returned.
+    """
+    remaining = list(packages)
+    skipped = []
+
+    for attempt in range(1, max_retries + 1):
+        # Write current package list
+        content = build_csproj(remaining, target_framework)
+        csproj_path.parent.mkdir(parents=True, exist_ok=True)
+        csproj_path.write_text(content, encoding="utf-8")
+
+        success, offenders = _try_restore(csproj_path)
+
+        if success:
+            if skipped:
+                print(
+                    f"  [INFO] Restore succeeded after stripping {len(skipped)} incompatible "
+                    f"package(s): {[p['id'] for p in skipped]}",
+                    file=sys.stderr,
+                )
+            return remaining
+
+        if not offenders:
+            # Restore failed for a reason other than NU1202 — not our problem to fix.
+            # Leave the file as-is and let Semgrep report the failure.
+            print(
+                f"  [WARN] Restore failed (attempt {attempt}) for reasons other than NU1202 — "
+                f"leaving synthetic .csproj in place.",
+                file=sys.stderr,
+            )
+            return remaining
+
+        # Strip offending packages and retry
+        offender_ids = {pkg_id.lower() for pkg_id, _ in offenders}
+        newly_skipped = [p for p in remaining if p["id"].lower() in offender_ids]
+        remaining = [p for p in remaining if p["id"].lower() not in offender_ids]
+
+        for pkg in newly_skipped:
+            print(
+                f"  [SKIP] {pkg['id']} {pkg['version']} — incompatible with {target_framework} "
+                f"(NU1202), excluded from synthetic .csproj",
+                file=sys.stderr,
+            )
+        skipped.extend(newly_skipped)
+
+        if not remaining:
+            print(
+                f"  [WARN] All packages stripped as incompatible — skipping {csproj_path}",
+                file=sys.stderr,
+            )
+            csproj_path.unlink(missing_ok=True)
+            return []
+
+    print(
+        f"  [WARN] Still failing after {max_retries} strip attempts — leaving last attempt in place.",
+        file=sys.stderr,
+    )
+    return remaining
+
+
+# ---------------------------------------------------------------------------
+# Convert pipeline
+# ---------------------------------------------------------------------------
+
+def convert(
+    input_path: Path,
+    output_path: Path | None = None,
+    dry_run: bool = False,
+    validate_restore: bool = False,
+) -> str | None:
+    """
+    Full pipeline: parse → resolve TFM → render → optionally write → optionally validate.
     Returns the rendered csproj string (useful for stdout mode).
     """
     packages = parse_packages_config(input_path)
@@ -188,38 +287,48 @@ def convert(input_path: Path, output_path: Path | None = None, dry_run: bool = F
         return None
 
     tfm = resolve_target_framework(packages)
-    csproj_content = build_csproj(packages, tfm)
 
     if output_path is None:
-        return csproj_content  # caller will print to stdout
+        # stdout mode — no restore validation possible
+        csproj_content = build_csproj(packages, tfm)
+        return csproj_content
 
     if dry_run:
         print(f"  [DRY RUN] Would write {len(packages)} packages → {output_path}")
-        return csproj_content
+        return build_csproj(packages, tfm)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(csproj_content, encoding="utf-8")
-    print(f"  [OK] {input_path} → {output_path} ({len(packages)} packages, TFM: {tfm})")
-    return csproj_content
+    if validate_restore:
+        # Write + restore-validate, stripping incompatible packages as needed
+        remaining = strip_incompatible_packages(packages, output_path, tfm)
+        if not remaining:
+            return None
+        final_content = build_csproj(remaining, tfm)
+        output_path.write_text(final_content, encoding="utf-8")
+        print(
+            f"  [OK] {input_path} → {output_path} "
+            f"({len(remaining)}/{len(packages)} packages, TFM: {tfm})"
+        )
+        return final_content
+    else:
+        # Write without restore validation (default — fast path for CI)
+        csproj_content = build_csproj(packages, tfm)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(csproj_content, encoding="utf-8")
+        print(f"  [OK] {input_path} → {output_path} ({len(packages)} packages, TFM: {tfm})")
+        return csproj_content
 
 
 # ---------------------------------------------------------------------------
 # Directory scan mode
 # ---------------------------------------------------------------------------
 
-# Synthetic files go in their own subdirectory to avoid MSB1050:
-# "folder contains more than one project or solution file"
-# This happens when the synthetic .csproj lands next to an existing .csproj
-# and dotnet restore can't determine which one to use.
 SYNTHETIC_SUBDIR = "_semgrep_sc"
 SYNTHETIC_FILENAME = "project.csproj"
 
 
-def scan_directory(root_dir: Path, dry_run: bool = False) -> int:
+def scan_directory(root_dir: Path, dry_run: bool = False, validate_restore: bool = False) -> int:
     """
     Recursively find all packages.config files under root_dir and convert each one.
-    Each synthetic .csproj is written to a _semgrep_sc/ subdirectory alongside
-    the packages.config, keeping it isolated from any existing .csproj files.
     Returns the count of files processed.
     """
     found = list(root_dir.rglob("packages.config"))
@@ -231,11 +340,14 @@ def scan_directory(root_dir: Path, dry_run: bool = False) -> int:
     print(f"Found {len(found)} packages.config file(s):\n")
     count = 0
     for cfg_path in found:
-        # Place the synthetic .csproj in its own subdirectory so dotnet restore
-        # sees exactly one project file when pointed at that folder.
         output_path = cfg_path.parent / SYNTHETIC_SUBDIR / SYNTHETIC_FILENAME
         try:
-            result = convert(cfg_path, output_path, dry_run=dry_run)
+            result = convert(
+                cfg_path,
+                output_path,
+                dry_run=dry_run,
+                validate_restore=validate_restore,
+            )
             if result is not None:
                 count += 1
         except ValueError as e:
@@ -278,6 +390,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print what would be written without writing any files",
     )
+    parser.add_argument(
+        "--validate-restore",
+        action="store_true",
+        help=(
+            "After writing each synthetic .csproj, attempt dotnet restore and strip any "
+            "packages that cause NU1202 incompatibility errors, then retry. "
+            "Requires dotnet on PATH. Slower but maximises the packages Semgrep can scan."
+        ),
+    )
 
     return parser
 
@@ -286,17 +407,19 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # --- Scan directory mode ---
     if args.scan_dir:
         root = Path(args.scan_dir)
         if not root.is_dir():
             print(f"ERROR: --scan-dir '{root}' is not a directory.", file=sys.stderr)
             sys.exit(1)
-        count = scan_directory(root, dry_run=args.dry_run)
+        count = scan_directory(
+            root,
+            dry_run=args.dry_run,
+            validate_restore=args.validate_restore,
+        )
         print(f"\nDone. {count} file(s) converted.")
         sys.exit(0)
 
-    # --- Single file mode ---
     input_path = Path(args.input)
     if not input_path.is_file():
         print(f"ERROR: '{input_path}' not found or is not a file.", file=sys.stderr)
@@ -304,7 +427,12 @@ def main():
 
     output_path = Path(args.output) if args.output else None
 
-    result = convert(input_path, output_path, dry_run=args.dry_run)
+    result = convert(
+        input_path,
+        output_path,
+        dry_run=args.dry_run,
+        validate_restore=args.validate_restore,
+    )
 
     if output_path is None and result is not None:
         print(result)
