@@ -27,6 +27,8 @@ from packages_config_to_csproj import (
     convert,
     scan_directory,
     strip_incompatible_packages,
+    parse_direct_deps_from_assets,
+    resolve_direct_packages,
     _NU1202_RE,
     SYNTHETIC_SUBDIR,
     SYNTHETIC_FILENAME,
@@ -589,6 +591,122 @@ class TestScanDirectory:
             assert count == 0
 
 
+
+
+# ---------------------------------------------------------------------------
+# Test: parse_direct_deps_from_assets + resolve_direct_packages
+# ---------------------------------------------------------------------------
+
+class TestDirectTransitiveSplit:
+    """
+    Tests for the project.assets.json parsing that identifies true direct
+    vs transitive dependencies so the synthetic .csproj only lists directs.
+    """
+
+    def _write_assets(self, tmpdir: Path, direct_ids: list[str]) -> Path:
+        """Write a minimal project.assets.json with the given direct dep IDs."""
+        obj_dir = tmpdir / "obj"
+        obj_dir.mkdir(parents=True, exist_ok=True)
+        assets = {
+            "version": 3,
+            "targets": {},
+            "libraries": {},
+            "projectFileDependencyGroups": {
+                "net48": [f"{pkg} >= 1.0.0" for pkg in direct_ids]
+            },
+            "packageFolders": {},
+            "project": {}
+        }
+        path = obj_dir / "project.assets.json"
+        import json
+        path.write_text(json.dumps(assets), encoding="utf-8")
+        return path
+
+    def test_parses_direct_ids_from_assets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assets_path = self._write_assets(
+                Path(tmpdir),
+                ["Newtonsoft.Json", "log4net", "Autofac"]
+            )
+            direct_ids = parse_direct_deps_from_assets(assets_path)
+            assert "newtonsoft.json" in direct_ids
+            assert "log4net" in direct_ids
+            assert "autofac" in direct_ids
+
+    def test_returns_empty_set_for_missing_file(self):
+        direct_ids = parse_direct_deps_from_assets(Path("/nonexistent/project.assets.json"))
+        assert direct_ids == set()
+
+    def test_returns_empty_set_for_invalid_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad = Path(tmpdir) / "obj" / "project.assets.json"
+            bad.parent.mkdir()
+            bad.write_text("not json")
+            direct_ids = parse_direct_deps_from_assets(bad)
+            assert direct_ids == set()
+
+    def test_case_insensitive_matching(self):
+        """Package IDs are case-insensitive in NuGet."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assets_path = self._write_assets(Path(tmpdir), ["Newtonsoft.Json"])
+            direct_ids = parse_direct_deps_from_assets(assets_path)
+            assert "newtonsoft.json" in direct_ids  # stored lowercase
+
+    def test_resolve_splits_direct_from_transitive(self):
+        """
+        Core scenario: packages.config has 5 packages, project.assets.json
+        says only 2 are truly direct. resolve_direct_packages should split them.
+        """
+        packages = [
+            {"id": "Newtonsoft.Json", "version": "13.0.1", "targetFramework": "net48", "developmentDependency": False},
+            {"id": "log4net", "version": "2.0.15", "targetFramework": "net48", "developmentDependency": False},
+            {"id": "Castle.Core", "version": "5.1.1", "targetFramework": "net48", "developmentDependency": False},
+            {"id": "System.Runtime", "version": "4.3.1", "targetFramework": "net48", "developmentDependency": False},
+            {"id": "Microsoft.Bcl", "version": "1.1.10", "targetFramework": "net48", "developmentDependency": False},
+        ]
+        # Only Newtonsoft.Json and log4net are truly direct
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assets_path = self._write_assets(
+                Path(tmpdir), ["Newtonsoft.Json", "log4net"]
+            )
+            csproj_path = assets_path.parent.parent / "project.csproj"
+            direct, transitive = resolve_direct_packages(packages, csproj_path)
+
+        assert len(direct) == 2
+        assert len(transitive) == 3
+        direct_ids = [p["id"] for p in direct]
+        assert "Newtonsoft.Json" in direct_ids
+        assert "log4net" in direct_ids
+        transitive_ids = [p["id"] for p in transitive]
+        assert "Castle.Core" in transitive_ids
+
+    def test_resolve_falls_back_to_all_direct_if_no_assets(self):
+        """If project.assets.json is missing, return all packages as direct."""
+        packages = [
+            {"id": "Newtonsoft.Json", "version": "13.0.1", "targetFramework": "net48", "developmentDependency": False},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # No obj/ directory created - assets file won't exist
+            csproj_path = Path(tmpdir) / "project.csproj"
+            direct, transitive = resolve_direct_packages(packages, csproj_path)
+
+        assert len(direct) == 1
+        assert len(transitive) == 0
+
+    def test_rewritten_csproj_contains_only_direct_deps(self):
+        """
+        After resolve_direct_packages, building the .csproj with only direct
+        deps should NOT include the transitive ones.
+        """
+        direct = [
+            {"id": "Newtonsoft.Json", "version": "13.0.1", "developmentDependency": False},
+        ]
+        result = build_csproj(direct, "net48")
+        assert "Newtonsoft.Json" in result
+        assert "Castle.Core" not in result
+        assert "System.Runtime" not in result
+
+
 # ---------------------------------------------------------------------------
 # Simple self-runner (no pytest required)
 # ---------------------------------------------------------------------------
@@ -600,6 +718,7 @@ def run_tests_without_pytest():
         TestBuildCsproj,
         TestNU1202Regex,
         TestStripIncompatiblePackages,
+        TestDirectTransitiveSplit,
         TestConvert,
         TestScanDirectory,
     ]

@@ -10,9 +10,14 @@ Each synthetic .csproj is placed in its own subdirectory (_semgrep_sc/)
 next to the packages.config. This avoids the MSB1050 error that occurs
 when dotnet restore finds multiple .csproj files in the same folder.
 
-If dotnet restore fails with NU1202 (incompatible package TFM), the
-offending packages are automatically stripped and restore is retried,
-so that the remaining compatible packages are still scanned.
+When --validate-restore is passed the script:
+  1. Writes all packages.config entries as <PackageReference>
+  2. Runs dotnet restore, stripping NU1202-incompatible packages as needed
+  3. Parses obj/project.assets.json to identify which packages are truly
+     direct (listed in projectFileDependencyGroups) vs transitive
+  4. Rewrites the synthetic .csproj with ONLY the true direct packages
+  5. Runs dotnet restore a final time so the lockfile reflects the correct
+     direct/transitive split that Semgrep Supply Chain will read
 
 Usage:
     # Single file, output to stdout
@@ -24,11 +29,15 @@ Usage:
     # Walk an entire repo and convert every packages.config found
     python packages_config_to_csproj.py --scan-dir ./src
 
+    # Full pipeline: strip incompatibles + resolve direct/transitive split
+    python packages_config_to_csproj.py --scan-dir ./src --validate-restore
+
     # Dry run (print what would be created, don't write)
     python packages_config_to_csproj.py --scan-dir ./src --dry-run
 """
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -82,7 +91,6 @@ def parse_packages_config(path: Path) -> list[dict]:
     return packages
 
 
-# Canonical .NET Framework TFM order from oldest to newest.
 _NET_TFM_ORDER = [
     "net20", "net30", "net35",
     "net40", "net403",
@@ -94,7 +102,6 @@ _NET_TFM_ORDER = [
 
 
 def _tfm_rank(tfm: str) -> int:
-    """Return a sortable rank for a TFM string. Unknown TFMs sort to the end."""
     try:
         return _NET_TFM_ORDER.index(tfm.lower())
     except ValueError:
@@ -102,16 +109,11 @@ def _tfm_rank(tfm: str) -> int:
 
 
 def resolve_target_framework(packages: list[dict], fallback: str = "net48") -> str:
-    """
-    Pick the highest TargetFramework across all packages.
-    Incompatible packages are handled at restore time by strip_incompatible_packages().
-    """
+    """Pick the highest TargetFramework across all packages."""
     tfms = list(set(p["targetFramework"] for p in packages if p["targetFramework"]))
     if not tfms:
         return fallback
-
     highest = max(tfms, key=_tfm_rank)
-
     if len(tfms) > 1:
         print(
             f"  [INFO] Multiple targetFramework values found: {sorted(tfms)}. "
@@ -122,9 +124,7 @@ def resolve_target_framework(packages: list[dict], fallback: str = "net48") -> s
 
 
 def build_csproj(packages: list[dict], target_framework: str) -> str:
-    """
-    Render the synthetic .csproj XML string.
-    """
+    """Render the synthetic .csproj XML string."""
     lines = [
         '<Project Sdk="Microsoft.NET.Sdk">',
         "",
@@ -160,10 +160,85 @@ def build_csproj(packages: list[dict], target_framework: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# project.assets.json parsing - direct vs transitive resolution
+# ---------------------------------------------------------------------------
+
+def parse_direct_deps_from_assets(assets_path: Path) -> set[str]:
+    """
+    Parse obj/project.assets.json and return the set of package IDs that are
+    true direct dependencies (i.e. listed in projectFileDependencyGroups).
+
+    projectFileDependencyGroups contains entries like:
+        "net48": ["Newtonsoft.Json >= 13.0.1", "Autofac >= 6.5.0"]
+
+    Everything else in the full graph is transitive.
+
+    Returns lowercase package IDs for case-insensitive comparison.
+    """
+    try:
+        with open(assets_path, encoding="utf-8") as f:
+            assets = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  [WARN] Could not parse {assets_path}: {e}", file=sys.stderr)
+        return set()
+
+    direct_ids = set()
+    dep_groups = assets.get("projectFileDependencyGroups", {})
+
+    for tfm, deps in dep_groups.items():
+        for dep in deps:
+            # Each entry looks like "PackageName >= 1.2.3" or "PackageName [1.2.3]"
+            # We just want the package name — everything before the first space
+            pkg_id = dep.split()[0].strip().lower()
+            if pkg_id:
+                direct_ids.add(pkg_id)
+
+    return direct_ids
+
+
+def resolve_direct_packages(
+    packages: list[dict],
+    csproj_path: Path,
+) -> tuple[list[dict], list[dict]]:
+    """
+    After a successful dotnet restore, parse obj/project.assets.json to determine
+    which packages from the input list are truly direct vs transitive.
+
+    Returns (direct_packages, transitive_packages).
+
+    If project.assets.json cannot be found or parsed, returns all packages as
+    direct (safe fallback - no information lost, just no direct/transitive split).
+    """
+    assets_path = csproj_path.parent / "obj" / "project.assets.json"
+
+    if not assets_path.exists():
+        print(
+            f"  [WARN] project.assets.json not found at {assets_path} - "
+            f"treating all packages as direct (no direct/transitive split).",
+            file=sys.stderr,
+        )
+        return packages, []
+
+    direct_ids = parse_direct_deps_from_assets(assets_path)
+
+    if not direct_ids:
+        print(
+            f"  [WARN] No direct deps found in {assets_path} - "
+            f"treating all packages as direct.",
+            file=sys.stderr,
+        )
+        return packages, []
+
+    direct = [p for p in packages if p["id"].lower() in direct_ids]
+    transitive = [p for p in packages if p["id"].lower() not in direct_ids]
+
+    return direct, transitive
+
+
+# ---------------------------------------------------------------------------
 # Restore validation + incompatible package stripping
 # ---------------------------------------------------------------------------
 
-# Matches: error NU1202: Package 'SomePackage 1.2.3' is not compatible with ...
 _NU1202_RE = re.compile(
     r"NU1202: Package '?([A-Za-z0-9._\-]+)\s+([\d.]+)'? is not compatible",
     re.IGNORECASE,
@@ -177,14 +252,13 @@ def _try_restore(csproj_path: Path) -> tuple[bool, list[tuple[str, str]]]:
     any packages that caused NU1202 incompatibility errors.
     """
     result = subprocess.run(
-        ["dotnet", "restore", str(csproj_path), "--no-dependencies"],
+        ["dotnet", "restore", str(csproj_path), "--use-lock-file"],
         capture_output=True,
         text=True,
     )
     if result.returncode == 0:
         return True, []
 
-    # Parse NU1202 offenders from stderr + stdout
     combined = result.stdout + result.stderr
     offenders = []
     for match in _NU1202_RE.finditer(combined):
@@ -200,19 +274,15 @@ def strip_incompatible_packages(
     max_retries: int = 5,
 ) -> list[dict]:
     """
-    Write the synthetic .csproj, attempt dotnet restore, and if it fails with
-    NU1202 errors strip the offending packages and retry. Repeat up to
-    max_retries times so that multiple incompatible packages are all removed.
+    Write the synthetic .csproj, attempt dotnet restore, strip NU1202 offenders,
+    and retry up to max_retries times.
 
-    Returns the final list of compatible packages (may be smaller than input).
-    This is a no-op when dotnet is not on PATH (e.g. during unit tests that
-    don't have a real .NET SDK available) - in that case the full list is returned.
+    Returns the final list of compatible packages.
     """
     remaining = list(packages)
     skipped = []
 
     for attempt in range(1, max_retries + 1):
-        # Write current package list
         content = build_csproj(remaining, target_framework)
         csproj_path.parent.mkdir(parents=True, exist_ok=True)
         csproj_path.write_text(content, encoding="utf-8")
@@ -229,8 +299,6 @@ def strip_incompatible_packages(
             return remaining
 
         if not offenders:
-            # Restore failed for a reason other than NU1202 - not our problem to fix.
-            # Leave the file as-is and let Semgrep report the failure.
             print(
                 f"  [WARN] Restore failed (attempt {attempt}) for reasons other than NU1202 - "
                 f"leaving synthetic .csproj in place.",
@@ -238,7 +306,6 @@ def strip_incompatible_packages(
             )
             return remaining
 
-        # Strip offending packages and retry
         offender_ids = {pkg_id.lower() for pkg_id, _ in offenders}
         newly_skipped = [p for p in remaining if p["id"].lower() in offender_ids]
         remaining = [p for p in remaining if p["id"].lower() not in offender_ids]
@@ -278,6 +345,14 @@ def convert(
 ) -> str | None:
     """
     Full pipeline: parse -> resolve TFM -> render -> optionally write -> optionally validate.
+
+    When validate_restore=True:
+      - Strips NU1202-incompatible packages via strip_incompatible_packages()
+      - Parses project.assets.json to identify true direct vs transitive deps
+      - Rewrites the .csproj with only direct deps so NuGet resolves transitives
+        naturally, giving Semgrep a lockfile with correct direct/transitive labels
+      - Runs a final dotnet restore to produce the clean lockfile
+
     Returns the rendered csproj string (useful for stdout mode).
     """
     packages = parse_packages_config(input_path)
@@ -289,28 +364,55 @@ def convert(
     tfm = resolve_target_framework(packages)
 
     if output_path is None:
-        # stdout mode - no restore validation possible
-        csproj_content = build_csproj(packages, tfm)
-        return csproj_content
+        return build_csproj(packages, tfm)
 
     if dry_run:
         print(f"  [DRY RUN] Would write {len(packages)} packages -> {output_path}")
         return build_csproj(packages, tfm)
 
     if validate_restore:
-        # Write + restore-validate, stripping incompatible packages as needed
-        remaining = strip_incompatible_packages(packages, output_path, tfm)
-        if not remaining:
+        # Step 1: Write all packages, strip NU1202 incompatibles
+        compatible = strip_incompatible_packages(packages, output_path, tfm)
+        if not compatible:
             return None
-        final_content = build_csproj(remaining, tfm)
+
+        # Step 2: Parse project.assets.json to split direct vs transitive
+        direct, transitive = resolve_direct_packages(compatible, output_path)
+
+        if transitive:
+            print(
+                f"  [INFO] Direct/transitive split: {len(direct)} direct, "
+                f"{len(transitive)} transitive (will be resolved by NuGet automatically)",
+                file=sys.stderr,
+            )
+
+        # Step 3: Rewrite .csproj with ONLY direct deps
+        # NuGet restore will pull in the transitives naturally, and the resulting
+        # packages.lock.json will have the correct direct/transitive labels
+        final_content = build_csproj(direct if direct else compatible, tfm)
         output_path.write_text(final_content, encoding="utf-8")
+
+        # Step 4: Final restore to produce clean lockfile
+        success, _ = _try_restore(output_path)
+        if not success:
+            print(
+                f"  [WARN] Final restore failed after direct/transitive rewrite - "
+                f"reverting to full package list.",
+                file=sys.stderr,
+            )
+            # Revert to full compatible list so Semgrep gets something
+            fallback_content = build_csproj(compatible, tfm)
+            output_path.write_text(fallback_content, encoding="utf-8")
+            _try_restore(output_path)
+
+        used = direct if direct else compatible
         print(
             f"  [OK] {input_path} -> {output_path} "
-            f"({len(remaining)}/{len(packages)} packages, TFM: {tfm})"
+            f"({len(used)} direct / {len(compatible)} total packages, TFM: {tfm})"
         )
-        return final_content
+        return output_path.read_text(encoding="utf-8")
+
     else:
-        # Write without restore validation (default - fast path for CI)
         csproj_content = build_csproj(packages, tfm)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(csproj_content, encoding="utf-8")
@@ -327,10 +429,6 @@ SYNTHETIC_FILENAME = "project.csproj"
 
 
 def scan_directory(root_dir: Path, dry_run: bool = False, validate_restore: bool = False) -> int:
-    """
-    Recursively find all packages.config files under root_dir and convert each one.
-    Returns the count of files processed.
-    """
     found = list(root_dir.rglob("packages.config"))
 
     if not found:
@@ -394,9 +492,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--validate-restore",
         action="store_true",
         help=(
-            "After writing each synthetic .csproj, attempt dotnet restore and strip any "
-            "packages that cause NU1202 incompatibility errors, then retry. "
-            "Requires dotnet on PATH. Slower but maximises the packages Semgrep can scan."
+            "After writing each synthetic .csproj: strip NU1202-incompatible packages, "
+            "parse project.assets.json to identify true direct deps, rewrite the .csproj "
+            "with only direct deps so NuGet resolves transitives naturally, then run a "
+            "final restore. Produces a lockfile with correct direct/transitive labels for "
+            "Semgrep. Requires dotnet on PATH. Slower but highest-quality output."
         ),
     )
 
