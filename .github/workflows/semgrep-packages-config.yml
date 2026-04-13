@@ -23,7 +23,7 @@ jobs:
 
   semgrep:
     name: Semgrep Supply Chain Scan
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     needs: test-converter
     if: github.actor != 'dependabot[bot]'
     steps:
