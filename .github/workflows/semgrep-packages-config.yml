@@ -43,9 +43,15 @@ jobs:
         # This ensures the maximum number of packages are scanned even when a repo
         # contains old packages that only ship ancient TFM assets (e.g. net35-only).
         run: python scripts/packages_config_to_csproj.py --scan-dir . --validate-restore
+      - name: Generate lock files from synthetic .csproj files
+        run: |
+          find . -path "*/_semgrep_sc/project.csproj" | while read csproj; do
+            echo "Restoring $csproj"
+            dotnet restore "$csproj" --use-lock-file || echo "  [WARN] Restore failed for $csproj"
+          done
 
       - name: Run Semgrep
-        run: semgrep ci --allow-local-builds
+        run: semgrep ci
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
 
